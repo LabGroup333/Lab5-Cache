@@ -1,0 +1,355 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// 4-way, write-back, write-allocate data cache with tree-LRU.
+// Single-cycle "miss" on the first access via rising-edge detect.
+// Exposes hit/miss for debugging.
+//////////////////////////////////////////////////////////////////////////////////
+
+module DataCache(
+  input  logic         CLK,
+  input  logic         RST,
+
+  //── CPU interface ──────────────────────────────────────────────────────────
+  output logic [31:0] dbg_wr_addr,
+  output logic [31:0] dbg_wr_data,
+  output logic [31:0] dbg_rd_addr,
+  output logic [31:0] dbg_rd_data,
+  
+  input  logic         cpu_req,     // high while CPU wants a load/store
+  input  logic         cpu_rw,      // 1=store, 0=load
+  input  logic [31:0]  cpu_addr,    // byte addr, word-aligned
+  input  logic [31:0]  cpu_wdata,   // data to store
+  output logic [31:0]  cpu_rdata,   // data from load
+  output logic         cpu_ready,   // one-cycle "done" pulse
+  output logic         cpu_stall,   // hold CPU while miss/refill
+  output logic         hit,         // asserted on a hit
+  output logic         miss,        // single-cycle pulse on a miss
+
+  //── Memory interface ──────────────────────────────────────────────────────
+  output logic         MEM_RDEN2,   // read enable for refill
+  output logic         MEM_WE2,     // write enable for write-back
+  output logic [31:0]  MEM_ADDR2,   // line address
+  output logic [31:0]  MEM_DIN2,    // write-back data
+  input  logic [31:0]  MEM_DOUT2    // refill data
+);
+
+  //-------------------------------------------------------------------------
+  // 0) Parameters & derived widths
+  //-------------------------------------------------------------------------
+  parameter NUM_WAYS    = 4;
+  parameter NUM_SETS    = 16;
+  parameter BLOCK_WORDS = 4;
+
+  localparam INDEX_BITS  = $clog2(NUM_SETS);
+  localparam OFFSET_BITS = $clog2(BLOCK_WORDS);
+  localparam TAG_BITS    = 32 - INDEX_BITS - OFFSET_BITS - 2; // word-aligned
+
+  //-------------------------------------------------------------------------
+  // 1) Rising-edge detect
+  //-------------------------------------------------------------------------
+  logic prev_req;                      // holds cpu_req from prior cycle
+  wire  req_rise = cpu_req && !prev_req;
+
+  always_ff @(posedge CLK or posedge RST) begin
+    if (RST) prev_req <= 1'b0;
+    else     prev_req <= cpu_req;
+  end
+
+  //-------------------------------------------------------------------------
+  // 2) Address breakdown
+  //-------------------------------------------------------------------------
+  logic [TAG_BITS-1:0]    req_tag;
+  logic [INDEX_BITS-1:0]  req_idx;
+  logic [OFFSET_BITS-1:0] req_ofs;
+
+  always_comb begin
+    req_ofs = cpu_addr[OFFSET_BITS+1 : 2];
+    req_idx = cpu_addr[OFFSET_BITS+INDEX_BITS+1 : OFFSET_BITS+2];
+    req_tag = cpu_addr[31 : OFFSET_BITS+INDEX_BITS+2];
+  end
+
+  //-------------------------------------------------------------------------
+  // 3) Cache arrays
+  //-------------------------------------------------------------------------
+  logic [31:0] data_mem [NUM_WAYS-1:0]
+                        [NUM_SETS-1:0]
+                        [BLOCK_WORDS-1:0];
+  logic [TAG_BITS-1:0] tag_mem   [NUM_WAYS-1:0][NUM_SETS-1:0];
+  logic                valid     [NUM_WAYS-1:0][NUM_SETS-1:0];
+  logic                dirty     [NUM_WAYS-1:0][NUM_SETS-1:0];
+
+  // 3-bit binary-tree LRU per set
+  logic lru_A [NUM_SETS-1:0], lru_B [NUM_SETS-1:0], lru_C [NUM_SETS-1:0];
+
+  //------------------------------------------------------------------------
+  // 4) Hit logic
+  //------------------------------------------------------------------------
+  logic [NUM_WAYS-1:0] way_hit;
+  genvar w; // generate variable for for-loop
+  generate
+    for (w = 0; w < NUM_WAYS; w++) begin
+      assign way_hit[w] =
+        valid[w][req_idx] &&
+        (tag_mem[w][req_idx] == req_tag);
+    end
+  endgenerate
+
+  // outputs
+  assign hit  = |way_hit;
+  assign miss = req_rise && !hit;     // only on that one-shot
+
+  logic [$clog2(NUM_WAYS)-1:0] hit_way;
+  always_comb begin
+    hit_way = '0;
+    for (int i = 0; i < NUM_WAYS; i++)
+      if (way_hit[i]) hit_way = i;
+  end
+
+  //------------------------------------------------------------------------
+  // 5) LRU helper
+  //------------------------------------------------------------------------
+  function automatic logic [$clog2(NUM_WAYS)-1:0] pick_victim(
+    input logic [INDEX_BITS-1:0] idx
+  );
+    logic A = lru_A[idx], B = lru_B[idx], C = lru_C[idx];
+    if (!A) return C ? 2 : 3;
+    else     return B ? 0 : 1;
+  endfunction
+
+  task automatic update_lru( //task-better than function
+    input logic [$clog2(NUM_WAYS)-1:0] w,
+    input logic [INDEX_BITS-1:0]       idx
+  );
+    if (w < 2) begin
+      lru_A[idx] <= 1'b0;
+      lru_B[idx] <= (w == 1);
+    end else begin
+      lru_A[idx] <= 1'b1;
+      lru_C[idx] <= (w == 3);
+    end
+  endtask
+
+  //------------------------------------------------------------------------
+  // 6) FSM states & regs
+  //------------------------------------------------------------------------
+  typedef enum logic [2:0] {
+    ST_IDLE,
+    ST_CHECK,
+    ST_EVICT,
+    ST_EVICT_WAIT,
+    ST_REFILL,
+    ST_REFILL_WAIT,
+    ST_RESPOND
+  } state_t;
+
+  state_t                          state, next_state;
+  logic [TAG_BITS-1:0] evict_tag;  
+  logic [TAG_BITS-1:0] refill_tag;  
+  logic [$clog2(BLOCK_WORDS)-1:0]  blk_cnt,    next_blk_cnt;
+  logic [$clog2(NUM_WAYS)-1:0]     vic_way;
+  logic [TAG_BITS-1:0]             vic_tag;
+  logic [INDEX_BITS-1:0]           vic_idx;
+
+  // sequential: state, blk_cnt
+ 
+  
+  always_ff @(posedge CLK or posedge RST) begin
+    if (RST) begin
+      vic_way    <= '0;
+      vic_idx    <= '0;
+      evict_tag  <= '0;
+      refill_tag <= '0;
+      state     <= ST_IDLE;
+      blk_cnt   <= '0;
+    end else begin
+      state     <= next_state;
+      blk_cnt   <= next_blk_cnt;
+      if (state == ST_CHECK && req_rise && !hit) begin
+      vic_idx    <= req_idx;                         // which set
+      vic_way    <= pick_victim(req_idx);            // which way
+      evict_tag  <= tag_mem[ pick_victim(req_idx) ][ req_idx ];       // tag will be evicted
+      refill_tag <= req_tag;                         // tag brought in
+    end
+    
+    //TESTING STUFF FOR TCL CONSOLE
+    
+    // 3) STORE-hit: in ST_CHECK when hit && cpu_rw
+    if (state == ST_CHECK && hit && cpu_rw) begin
+      // you also do the data_mem write and dirty<=1 here
+      $display("%0t ST_CHECK store-hit: way=%0d set=%0d ofs=%0d data=0x%08h",
+               $time, hit_way, req_idx, req_ofs, cpu_wdata);
+    end
+
+    // 4) EVICT phase: whenever state==ST_EVICT
+    if (state == ST_EVICT) begin
+      // your comb block drives MEM_WE2, MEM_ADDR2, MEM_DIN2 for this cycle
+      $display("%0t EVICT word %0d: addr=0x%08h data=0x%08h",
+               $time, blk_cnt, MEM_ADDR2, MEM_DIN2);
+    end
+
+    // 5) RESPOND-STORE: when you finish refill & do the store in ST_RESPOND
+    if (state == ST_RESPOND && cpu_rw) begin
+      $display("%0t RESPOND store-miss: way=%0d set=%0d ofs=%0d data=0x%08h",
+               $time, vic_way, vic_idx, req_ofs, cpu_wdata);
+    end
+
+    // 6) RESPOND-LOAD: if you want to print loads as well
+    if (state == ST_RESPOND && !cpu_rw) begin
+      $display("%0t RESPOND load:     way=%0d set=%0d ofs=%0d data=0x%08h",
+               $time, vic_way, vic_idx, req_ofs,
+               data_mem[vic_way][vic_idx][req_ofs]);
+    end
+    
+    end
+  end
+
+
+
+  //------------------------------------------------------------------------
+  // 7) FSM next-state + outputs
+  //------------------------------------------------------------------------
+  always_comb begin
+  
+  
+  
+    dbg_wr_addr = MEM_WE2   ? MEM_ADDR2 : 32'hX;
+    dbg_wr_data = MEM_WE2   ? MEM_DIN2  : 32'hX;
+    dbg_rd_addr = MEM_RDEN2 ? MEM_ADDR2 : 32'hX;
+    dbg_rd_data = MEM_RDEN2 ? MEM_DOUT2 : 32'hX;
+    // defaults
+    next_state = state;
+    next_blk_cnt = blk_cnt;
+
+    cpu_ready = 1'b0;
+    cpu_stall = 1'b0;
+    cpu_rdata = 32'hDEADBEEF;
+    MEM_RDEN2 = 1'b0;
+    MEM_WE2   = 1'b0;
+    MEM_ADDR2 = '0;
+    MEM_DIN2  = '0;
+
+    case (state)
+      ST_IDLE: begin
+        if (req_rise) begin
+          if (hit) begin
+            // HIT in one cycle
+            cpu_ready = 1;
+            update_lru(hit_way, req_idx);
+            if (cpu_rw) begin
+              data_mem[hit_way][req_idx][req_ofs] <= cpu_wdata;
+              dirty[hit_way][req_idx]            <= 1;
+            end else begin
+              cpu_rdata = data_mem[hit_way][req_idx][req_ofs];
+            end
+            next_state = ST_IDLE;
+          end else begin
+        // MISS: go to refill/evict
+        cpu_stall   = 1'b1;
+        vic_idx     = req_idx;
+        vic_way     = pick_victim(req_idx);
+        vic_tag     = tag_mem[vic_way][req_idx];
+        next_blk_cnt = '0;
+        next_state  = dirty[vic_way][req_idx]
+                      ? ST_EVICT
+                      : ST_REFILL;
+      end
+    end
+  end
+  
+  
+
+ST_CHECK: begin
+      if (hit) begin
+        // HIT path
+        cpu_ready = 1'b1;
+        // update LRU on the hit way
+        update_lru(hit_way, req_idx);
+
+        if (cpu_rw) begin
+          // STORE on a hit: write into cache, mark dirty
+          data_mem[hit_way][req_idx][req_ofs] = cpu_wdata;
+          dirty    [hit_way][req_idx]         = 1'b1;
+        end else begin
+          // LOAD on a hit: read from cache
+          cpu_rdata = data_mem[hit_way][req_idx][req_ofs];
+        end
+
+        next_state = ST_IDLE;
+      end else begin
+        // MISS path
+        cpu_stall   = 1'b1;          // hold CPU while missing
+        next_blk_cnt = '0;           // start refill/evict at word-0
+
+        // choose whether to write back or refill
+        if (dirty[pick_victim(req_idx)][req_idx])
+          next_state = ST_EVICT;
+        else
+          next_state = ST_REFILL;
+      end
+    end
+
+ST_EVICT: begin
+        cpu_stall = 1;
+        MEM_WE2   = 1;
+        MEM_ADDR2 = { evict_tag, vic_idx, blk_cnt, 2'b00 };
+        MEM_DIN2  = data_mem[vic_way][vic_idx][blk_cnt];
+        next_state = ST_EVICT_WAIT;
+      end
+
+ST_REFILL: begin
+        cpu_stall = 1;
+        MEM_RDEN2 = 1;
+        MEM_ADDR2 = { refill_tag, vic_idx, blk_cnt, 2'b00 };
+        next_state = ST_REFILL_WAIT;
+    end
+
+ST_REFILL_WAIT: begin
+      cpu_stall     = 1;
+      data_mem[vic_way][vic_idx][blk_cnt] <= MEM_DOUT2;
+      dirty[vic_way][vic_idx]            <= 1'b0;
+      if (blk_cnt == BLOCK_WORDS-1) begin
+        next_state   = ST_RESPOND;
+        next_blk_cnt = blk_cnt;         // stay at last word
+      end else begin
+        next_state   = ST_REFILL;       // go fetch the next one
+        next_blk_cnt = blk_cnt + 1;
+      end
+    end
+
+ST_RESPOND: begin
+        // install line
+        tag_mem[vic_way][vic_idx]   = req_tag;
+        valid[vic_way][vic_idx]     = 1'b1;
+        update_lru(vic_way, vic_idx);
+
+        if (cpu_rw) begin
+          data_mem[vic_way][vic_idx][req_ofs] = cpu_wdata;
+          dirty[vic_way][vic_idx]            = 1'b1;
+        end else
+          cpu_rdata = data_mem[vic_way][vic_idx][req_ofs];
+
+        cpu_ready = 1'b1;
+        next_state = ST_IDLE;
+      end
+
+    endcase
+    
+  end
+
+  //------------------------------------------------------------------------
+  // 8) Simulation init (optional)
+  //------------------------------------------------------------------------
+  initial begin
+    for (int i = 0; i < NUM_WAYS; i++)
+      for (int j = 0; j < NUM_SETS; j++) begin
+        valid[i][j]   = 1'b0;
+        dirty[i][j]   = 1'b0;
+        tag_mem[i][j] = '0;
+        for (int k = 0; k < BLOCK_WORDS; k++)
+          data_mem[i][j][k] = 32'b0;
+      end
+    for (int s = 0; s < NUM_SETS; s++)
+      { lru_A[s], lru_B[s], lru_C[s] } = 3'b000;
+  end
+
+endmodule
