@@ -1,0 +1,301 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: Cal Poly SLO
+// Engineer: Micah Miller
+// Create Date: 
+// Module Name: OTTER (top-level)
+//////////////////////////////////////////////////////////////////////////////////
+
+module OTTER(
+  input  logic        RST,
+  input  logic [31:0] IOBUS_IN,
+  input  logic        CLK,
+  output logic        IOBUS_WR,
+  output logic [31:0] IOBUS_OUT,
+  output logic [31:0] IOBUS_ADDR
+);
+
+  logic        mem_req, mem_rw;
+  logic [31:0] mem_rdata;
+  logic        mem_ready;
+  logic [3:0] alu_fun;
+  logic       alu_src_a;
+  logic [1:0] alu_src_b;
+  logic [31:0] alu_out;
+
+
+  // 1) ---------- Program Counter & Instruction Fetch -----------
+
+  logic        pc_rst, pc_write_internal;
+  logic [2:0]  pc_source;
+  logic [31:0] pc_out, pc_out_inc, jalr, branch, jal;
+  // in your declarations
+  logic        dcache_mem_rden2, dcache_mem_we2;
+  logic [31:0] dcache_mem_addr2, dcache_mem_din2;
+  logic [31:0] dcache_mem_dout2;
+
+  PC OTTER_PC(
+    .CLK       (CLK),
+    .RST       (pc_rst),
+    .PC_WRITE  (pc_write), //changed from pc_write_internal
+    .PC_SOURCE (pc_source),
+    .JALR      (jalr),
+    .JAL       (jal),
+    .BRANCH    (branch),
+    .MTVEC     (32'b0),
+    .MEPC      (32'b0),
+    .PC_OUT    (pc_out),
+    .PC_OUT_INC(pc_out_inc)
+  );
+
+//TERMINAL TESTING
+
+always_ff @(posedge CLK) begin
+  if (opcode == 7'b1100011 && pc_write_internal) begin
+    $display(
+      "%0t BLT@%08h: rs1=0x%08h rs2=0x%08h eq=%b lt=%b ltu=%b → PC_SRC=%b",
+      $time, pc_out, rs1_data, rs2_data,
+      br_eq, br_lt, br_ltu, pc_source
+    );
+  end
+end
+
+
+
+  logic [31:0] pc_out_aligned;
+  assign pc_out_aligned = { pc_out[31:2], 2'b00 };
+
+  // instruction-fetch via the distributed IMEM ports
+  logic [31:0]
+    imem_w0, imem_w1, imem_w2, imem_w3,
+    imem_w4, imem_w5, imem_w6, imem_w7;
+
+  // synchronous-read path unused
+  logic mem_rden1;
+
+  // instruction register
+  logic [31:0] ir;
+  assign ir = imem_w0;  // fetch the first word at PC
+
+
+  // 2) ------------ Decode fields ------------
+ 
+  logic [6:0] opcode;
+  logic [2:0] funct;
+  logic       is_load, is_store;
+
+  assign opcode   = ir[6:0];
+  assign funct    = ir[14:12];
+  assign is_load  = (opcode == 7'b0000011); // LB/LH/LW/LBU/LHU
+  assign is_store = (opcode == 7'b0100011); // SB/SH/SW
+
+
+  // 3) ------- Register File & Write-Back MUX --------
+ 
+  logic [4:0]  rs1, rs2, rd;
+  logic [31:0] rs1_data, rs2_data, wd;
+  logic        reg_wr;
+  logic [1:0]  rf_wr_sel;
+
+  assign rs1 = ir[19:15];
+  assign rs2 = ir[24:20];
+  assign rd  = ir[11:7];
+
+  // choose RF write-back source:
+  // 0=PC+4, 1=0, 2=load data, 3=ALU/JAL/others
+  FourMux OTTER_REG_MUX(
+    .SEL   (rf_wr_sel),
+    .ZERO  (pc_out_inc),
+    .ONE   (32'b0),
+    .TWO   (mem_rdata),   // load result from DataCache
+    .THREE (alu_out),     // ALU result / JAL / LUI
+    .OUT   (wd)
+  );
+
+  // RF write-enable:
+  //  for a load, only when DataCache says ready;
+  //  else whenever CU_FSM asserted reg_wr.
+  wire rf_we = reg_wr & (is_load ? mem_ready : 1'b1);
+
+  REG_FILE OTTER_REG_FILE(
+    .CLK  (CLK),
+    .EN   (rf_we),
+    .ADR1 (rs1),
+    .ADR2 (rs2),
+    .WA   (rd),
+    .WD   (wd),
+    .RS1  (rs1_data),
+    .RS2  (rs2_data)       // RS2 used later for stores
+  );
+
+
+  // 4) ---------- Immediate Generator -------------
+ 
+  logic [24:0] imgen_ir;
+  logic [31:0] Utype, Itype, Stype, Btype, Jtype;
+
+  assign imgen_ir = ir[31:7];
+  ImmediateGenerator OTTER_IMGEN(
+    .IR     (imgen_ir),
+    .U_TYPE (Utype),
+    .I_TYPE (Itype),
+    .S_TYPE (Stype),
+    .B_TYPE (Btype),
+    .J_TYPE (Jtype)
+  );
+
+
+  // 5) ---------------- Branch Address & Condition Generators ------------
+
+  logic [31:0] srcA, srcB;
+  logic        br_eq, br_lt, br_ltu;
+
+  BAG OTTER_BAG(
+    .RS1     (rs1_data),
+    .I_TYPE  (Itype),
+    .J_TYPE  (Jtype),
+    .B_TYPE  (Btype),
+    .FROM_PC (pc_out),
+    .JAL     (jal),
+    .JALR    (jalr),
+    .BRANCH  (branch)
+  );
+
+  BCG OTTER_BCG(
+    .RS1   (rs1_data),
+    .RS2   (rs2_data),
+    .BR_EQ (br_eq),
+    .BR_LT (br_lt),
+    .BR_LTU(br_ltu)
+  );
+
+
+  // 6) ---------- ALU & its MUXes -----------
+
+  TwoMux OTTER_ALU_MUXA(
+    .ALU_SRC_A(alu_src_a),
+    .RS1       (rs1_data),
+    .U_TYPE    (Utype),
+    .SRC_A     (srcA)
+  );
+
+  FourMux OTTER_ALU_MUXB(
+    .SEL   (alu_src_b),
+    .ZERO  (rs2_data),
+    .ONE   (Itype),
+    .TWO   (Stype),
+    .THREE (pc_out),
+    .OUT   (srcB)
+  );
+
+
+  ALU OTTER_ALU(
+    .SRC_A   (srcA),
+    .SRC_B   (srcB),
+    .ALU_FUN (alu_fun),
+    .RESULT  (alu_out)
+  );
+
+  // drive the shared address bus (to DataCache or MMIO)
+  assign IOBUS_ADDR = alu_out;
+
+
+  // 7) ------------- DataCache interface nets ----------------
+  
+  logic pc_stall; // from DataCache
+
+// only assert new transaction when the cache is idle
+wire cache_req = (is_load || is_store);
+assign mem_req = cache_req;
+assign mem_rw  = is_store   && !pc_stall;
+
+
+  // 8) -------------- Instantiation of the 4-way, write-back DataCache ---------------
+
+    DataCache dcache (
+    .CLK       (CLK),
+    .RST       (RST),
+    // CPU→cache
+    .cpu_req   (mem_req),
+    .cpu_rw    (mem_rw),
+    .cpu_addr  (alu_out),
+    .cpu_wdata (rs2_data),
+    .cpu_rdata (mem_rdata),
+    .cpu_ready (mem_ready),
+    .cpu_stall (pc_stall),
+    .hit       (data_hit),
+    .miss      (data_miss),
+    // cache→memory
+    .MEM_RDEN2 (dcache_mem_rden2),
+    .MEM_WE2   (dcache_mem_we2),
+    .MEM_ADDR2 (dcache_mem_addr2),
+    .MEM_DIN2  (dcache_mem_din2),
+    .MEM_DOUT2 (dcache_mem_dout2)
+  );
+  // drive PC only when cache not stalling
+  assign pc_write = pc_write_internal & ~pc_stall;
+
+
+  // 9) -------------- Main Memory instantiation (IMEM ports for instruction fetch) -------------
+
+  logic mem_sign;
+  logic [1:0] size;
+
+  assign size = ir[13:12];
+  assign mem_sign = ir[14];
+
+    Memory OTTER_MEMORY(
+    .MEM_CLK    (CLK),
+    .MEM_RDEN1  (mem_rden1),
+    .MEM_RDEN2  (dcache_mem_rden2),
+    .MEM_WE2    (dcache_mem_we2), 
+    .MEM_ADDR1  (14'b0),
+    .MEM_ADDR2  (dcache_mem_addr2),
+    .MEM_DIN2   (dcache_mem_din2),
+    .MEM_SIZE   (size),     
+    .MEM_SIGN   (sign),  
+    .IO_IN      (IOBUS_IN),
+    .IO_WR      (IOBUS_WR),
+    .MEM_DOUT1  (),
+    .MEM_DOUT2  (dcache_mem_dout2),   // refill data back into cache
+    // instruction pre-fetch ports
+    .IMEM_ADDR  (pc_out_aligned),
+    .IMEM_W0    (imem_w0), .IMEM_W1(imem_w1),
+    .IMEM_W2    (imem_w2), .IMEM_W3(imem_w3),
+    .IMEM_W4    (imem_w4), .IMEM_W5(imem_w5),
+    .IMEM_W6    (imem_w6), .IMEM_W7(imem_w7)
+  );
+
+
+  // 10) --------------- Control Unit FSM & Decoder -------------------
+
+  // reg_wr and pc_write_internal come from CU_FSM
+  CU_FSM OTTER_FSM(
+    .CLK       (CLK),
+    .RST       (RST),
+    .IR_OPCODE (opcode),
+    .PC_WRITE  (pc_write_internal),
+    .REG_WRITE (reg_wr),
+    .MEM_WE2   (dcache_mem_we2),  
+    .MEM_RDEN1 (mem_rden1),        
+    .MEM_RDEN2 (dcache_mem_rden2),         // handled by DataCache
+    .rst       (pc_rst)
+  );
+
+  CU_DCDR OTTER_DCDR(
+    .IR_30      (ir[30]),
+    .IR_OPCODE  (opcode),
+    .IR_FUNCT   (funct),
+    .BR_EQ      (br_eq),
+    .BR_LT      (br_lt),
+    .BR_LTU     (br_ltu),
+    .ALU_FUN    (alu_fun),
+    .ALU_SRCA   (alu_src_a),
+    .ALU_SRCB   (alu_src_b),
+    .PC_SOURCE  (pc_source),
+    .RF_WR_SEL  (rf_wr_sel)
+//    .is_load    (is_load),
+//    .is_store   (is_store)
+  );
+
+endmodule
